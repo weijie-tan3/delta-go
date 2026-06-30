@@ -116,7 +116,26 @@ Append on ADLS Gen2 uses the regular `Commit()` (no LogStore needed):
 	v, err := transaction.Commit()
 ```
 
+### Concurrency limitations
+
+Concurrent commits on ADLS Gen2 are coordinated purely by the object store's atomic rename
+(`RenameIfNotExists`) combined with optimistic retry — there is no Azure `Locker` implementation yet.
+This is correct (only one writer can win each version, so the log never forks), but it does **not**
+scale to very high writer counts:
+
+- On a conflict, a writer increments the target version by one and retries after `RetryWaitDuration`
+  (it only reloads the table's true latest version after `RetryCommitAttemptsBeforeLoadingTable`
+  attempts). With many simultaneous writers this is roughly O(N²) commit attempts.
+- Past a few tens of concurrent writers, the volume of retry/`Head`/rename calls can trip ADLS Gen2
+  throttling (often surfaced as `403 AuthorizationFailure`), which further slows or stalls progress.
+
+In practice ~50 concurrent lock-free writers commit reliably; pushing to 150+ may throttle or time out.
+For higher write concurrency, serialize commits with a real distributed lock (a `lock.Locker`
+implementation, e.g. one backed by an Azure blob lease) rather than relying on optimistic retry, and/or
+increase `RetryWaitDuration` to reduce the request rate.
+
 ### Running the Azure integration tests
+
 
 The live integration tests are gated behind the `azure_integration` build tag and are skipped unless
 the target account is configured, so they never run as part of `go test ./...`. Copy
