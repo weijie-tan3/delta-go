@@ -21,6 +21,7 @@ and then add the Parquet file to the Delta table using delta-go.
 | -------------------- | :-------------------: | ---------------------------------------------------------------- |
 | Local                |        ![done]        |                                                                  |
 | S3 - AWS             |        ![done]        | Requires lock for concurrent writes                              |
+| ADLS Gen2 - Azure    |        ![done]        | Hierarchical namespace (HNS) account; uses atomic rename         |
 
 
 ### Supported Operations
@@ -77,6 +78,55 @@ Append data to the table.  The data is in a parquet file located at `parquetRela
 ```
 
 There are also some simple examples available in the `examples/` folder.
+
+## Azure (ADLS Gen2)
+
+delta-go supports Azure Data Lake Storage Gen2 (storage accounts with hierarchical namespace enabled).
+Unlike S3, ADLS Gen2 provides an atomic rename, so concurrent writers are coordinated by the object
+store itself and no external LogStore is required for correctness.
+
+The base URI accepts either the `az://` or `abfss://` scheme:
+
+- `az://<container>/<path>` (the account is taken from the credential / `AZURE_STORAGE_ACCOUNT`)
+- `abfss://<container>@<account>.dfs.core.windows.net/<path>`
+
+Create a table on ADLS Gen2 using `azidentity.DefaultAzureCredential` (environment variables, managed
+identity, or `az login`):
+```golang
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	baseURI := storage.NewPath("abfss://my-container@myaccount.dfs.core.windows.net/tables/my-table")
+	store, err := azurestore.NewWithCredential(baseURI, cred, nil)
+	table := delta.NewTable(store, nillock.New(), localstate.New(-1))
+	metadata := delta.NewTableMetaData("Test Table", "test description", new(delta.Format).Default(), schema, []string{}, make(map[string]string))
+	err = table.Create(*metadata, new(delta.Protocol).Default(), delta.CommitInfo{}, []delta.Add{})
+```
+
+If you already have a configured `azdatalake` filesystem client (or a test mock), construct the store
+directly with `azurestore.New(client, baseURI)`.
+
+The data write then commit flow is the same as for any other store: write the Parquet file with
+`store.Put`, then add it to the table with `delta.NewAdd` and commit a transaction.
+
+Append on ADLS Gen2 uses the regular `Commit()` (no LogStore needed):
+```golang
+	add, _, err := delta.NewAdd(store, storage.NewPath(parquetRelativePath), make(map[string]string))
+	transaction := table.CreateTransaction(delta.NewTransactionOptions())
+	transaction.AddAction(add)
+	transaction.SetOperation(delta.Write{Mode: delta.Append})
+	v, err := transaction.Commit()
+```
+
+### Running the Azure integration tests
+
+The live integration tests are gated behind the `azure_integration` build tag and are skipped unless
+the target account is configured, so they never run as part of `go test ./...`. Copy
+`.env-azure.template` to `.env-azure`, fill it in, then:
+```sh
+	set -a; source .env-azure; set +a
+	go test -tags azure_integration ./storage/azurestore/ -run Integration -v
+```
+Authentication uses `azidentity.DefaultAzureCredential`. The account must have hierarchical namespace
+(ADLS Gen2) enabled.
 
 ## Storage configuration on S3
 
