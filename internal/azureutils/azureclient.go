@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -111,6 +112,15 @@ func mapError(err error) error {
 	}
 	if datalakeerror.HasCode(err, datalakeerror.PathAlreadyExists) {
 		return errors.Join(ErrAlreadyExists, err)
+	}
+	// Some operations (GetProperties, DownloadStream) are served by the blob
+	// endpoint, which reports a missing path as HTTP 404 BlobNotFound rather than
+	// the dfs PathNotFound code that HasCode matches. Fall back to the HTTP
+	// status so callers relying on ErrNotFound (e.g. Head-before-write guards)
+	// classify these correctly.
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
+		return errors.Join(ErrNotFound, err)
 	}
 	return err
 }

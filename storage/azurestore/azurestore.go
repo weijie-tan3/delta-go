@@ -221,13 +221,52 @@ func (s *AzureObjectStore) List(prefix storage.Path, previousResult *storage.Lis
 	if previousResult != nil {
 		marker = previousResult.NextToken
 	}
+
+	// ADLS Gen2 ListPaths lists the *contents of a directory* (the SDK's Prefix
+	// option maps to the REST "directory" parameter) and returns 404
+	// PathNotFound when that directory does not exist. delta-go's List contract
+	// is S3-style: return every object whose key begins with the prefix, where
+	// the final path segment may be a partial file name (e.g.
+	// "_delta_log/00000000000000000066" must match
+	// "…000066.checkpoint.parquet"). So:
+	//   1. Try the prefix as a directory (the common, efficient case:
+	//      "_delta_log", a checkpoint working folder, etc.).
+	//   2. If it is not an existing directory, list the PARENT directory and
+	//      filter to names beginning with the full prefix — emulating S3 prefix
+	//      semantics. A missing parent means no matches.
 	res, err := s.Client.List(context.Background(), fullPrefix, marker)
-	if err != nil {
+	if err == nil {
+		return buildListResult(res, "", trimPrefix), nil
+	}
+	if !errors.Is(err, azureutils.ErrNotFound) {
 		return storage.ListResult{}, errors.Join(storage.ErrListObjects, err)
 	}
+
+	parent := ""
+	if i := strings.LastIndex(fullPrefix, "/"); i >= 0 {
+		parent = fullPrefix[:i]
+	}
+	res, err = s.Client.List(context.Background(), parent, marker)
+	if err != nil {
+		if errors.Is(err, azureutils.ErrNotFound) {
+			return storage.ListResult{}, nil
+		}
+		return storage.ListResult{}, errors.Join(storage.ErrListObjects, err)
+	}
+	return buildListResult(res, fullPrefix, trimPrefix), nil
+}
+
+// buildListResult converts an azureutils listing into a storage.ListResult,
+// dropping directory entries, trimming the store's base prefix, and (when
+// namePrefix is non-empty) keeping only paths whose full name begins with
+// namePrefix.
+func buildListResult(res azureutils.ListResult, namePrefix, trimPrefix string) storage.ListResult {
 	listResult := storage.ListResult{Objects: make([]storage.ObjectMeta, 0, len(res.Paths))}
 	for _, p := range res.Paths {
 		if p.IsDirectory {
+			continue
+		}
+		if namePrefix != "" && !strings.HasPrefix(p.Name, namePrefix) {
 			continue
 		}
 		location := strings.TrimPrefix(p.Name, trimPrefix)
@@ -238,7 +277,7 @@ func (s *AzureObjectStore) List(prefix storage.Path, previousResult *storage.Lis
 		})
 	}
 	listResult.NextToken = res.NextMarker
-	return listResult, nil
+	return listResult
 }
 
 // ListAll lists all objects under a prefix, paging as required.
