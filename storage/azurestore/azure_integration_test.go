@@ -355,3 +355,136 @@ func TestIntegrationConcurrentWrites(t *testing.T) {
 		numWriters, len(commitVersions))
 }
 
+// TestIntegrationCheckpointAndPrefixList exercises the on-disk (streaming)
+// checkpoint path and the S3-style prefix semantics of List against a real ADLS
+// Gen2 (HNS) account. It is a regression test for the HNS ListPaths behavior:
+// the dfs List API lists the contents of an existing directory and 404s
+// otherwise, but delta-go calls List with file-name prefixes (the checkpoint
+// working folder, and "_delta_log/<version>" in DoesCheckpointVersionExist).
+// Before the fix those prefix lists 404'd and aborted every checkpoint.
+func TestIntegrationCheckpointAndPrefixList(t *testing.T) {
+	store, baseURI := newIntegrationStore(t)
+	t.Logf("checkpoint itest table at %s", baseURI.Raw)
+
+	if os.Getenv("AZURE_ITEST_KEEP") == "" {
+		t.Cleanup(func() {
+			if err := store.DeleteFolder(storage.NewPath("")); err != nil {
+				t.Logf("cleanup: failed to delete table folder: %v", err)
+			}
+		})
+	}
+
+	// Create the table (version 0) and commit a few data files so there is
+	// non-trivial state to checkpoint.
+	table := delta.NewTable(store, nillock.New(), localstate.New(-1))
+	metadata := delta.NewTableMetaData("delta-go azure checkpoint itest", "checkpoint + prefix list regression",
+		new(delta.Format).Default(), itestSchema(), []string{}, make(map[string]string))
+	if err := table.Create(*metadata, new(delta.Protocol).Default(), delta.CommitInfo{}, []delta.Add{}); err != nil {
+		t.Fatalf("table.Create failed: %v", err)
+	}
+
+	const commits = 3
+	for i := 0; i < commits; i++ {
+		fileName := fmt.Sprintf("part-%s.snappy.parquet", uuid.NewString())
+		if err := store.Put(storage.NewPath(fileName), makeParquet(t, 5)); err != nil {
+			t.Fatalf("writing parquet failed: %v", err)
+		}
+		add, _, err := delta.NewAdd(store, storage.NewPath(fileName), make(map[string]string))
+		if err != nil {
+			t.Fatalf("delta.NewAdd failed: %v", err)
+		}
+		txn := table.CreateTransaction(delta.NewTransactionOptions())
+		txn.AddAction(add)
+		txn.SetOperation(delta.Write{Mode: delta.Append})
+		if _, err := txn.Commit(); err != nil {
+			t.Fatalf("commit %d failed: %v", i, err)
+		}
+	}
+
+	version := table.State.Version
+	t.Logf("table at version %d", version)
+
+	// Sanity: a file-name prefix that is NOT a directory must return the
+	// matching files (S3 prefix semantics), not a 404. Before the fix this
+	// returned an error / empty on HNS.
+	verPrefix := storage.NewPath(fmt.Sprintf("_delta_log/%020d", version))
+	preList, err := store.ListAll(verPrefix)
+	if err != nil {
+		t.Fatalf("ListAll(%s) failed: %v", verPrefix.Raw, err)
+	}
+	var sawCommitJSON bool
+	for _, o := range preList.Objects {
+		if strings.HasSuffix(o.Location.Raw, fmt.Sprintf("%020d.json", version)) {
+			sawCommitJSON = true
+		}
+	}
+	if !sawCommitJSON {
+		t.Fatalf("prefix List(%s) did not return the commit json; got %d objects: %v",
+			verPrefix.Raw, len(preList.Objects), objectLocations(preList))
+	}
+
+	// A prefix under a non-existent directory must be an empty listing, not an
+	// error.
+	missing, err := store.ListAll(storage.NewPath("_delta_log/.tmp/nope-does-not-exist"))
+	if err != nil {
+		t.Fatalf("ListAll(missing) should be empty, got error: %v", err)
+	}
+	if len(missing.Objects) != 0 {
+		t.Fatalf("ListAll(missing) returned %d objects, want 0", len(missing.Objects))
+	}
+
+	// Streaming (on-disk optimize) checkpoint — the path that failed on HNS
+	// because it lists a freshly-generated, not-yet-existing working folder.
+	optConfig, err := delta.NewOptimizeCheckpointConfiguration(store, version)
+	if err != nil {
+		t.Fatalf("NewOptimizeCheckpointConfiguration failed: %v", err)
+	}
+	cpConfig := delta.NewCheckpointConfiguration()
+	cpConfig.ReadWriteConfiguration = *optConfig
+	created, err := table.CreateCheckpoint(nillock.New(), cpConfig, version)
+	if err != nil {
+		t.Fatalf("CreateCheckpoint failed: %v", err)
+	}
+	if !created {
+		t.Fatalf("CreateCheckpoint returned created=false")
+	}
+
+	// The checkpoint parquet and the _last_checkpoint pointer must now exist.
+	checkpointFile := storage.NewPath(fmt.Sprintf("_delta_log/%020d.checkpoint.parquet", version))
+	if _, err := store.Head(checkpointFile); err != nil {
+		t.Fatalf("expected checkpoint %s to exist: %v", checkpointFile.Raw, err)
+	}
+	if _, err := store.Head(storage.NewPath("_delta_log/_last_checkpoint")); err != nil {
+		t.Fatalf("expected _last_checkpoint to exist: %v", err)
+	}
+
+	// With correct prefix List, DoesCheckpointVersionExist must now find it.
+	exists, err := delta.DoesCheckpointVersionExist(store, version, false)
+	if err != nil {
+		t.Fatalf("DoesCheckpointVersionExist failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("DoesCheckpointVersionExist(%d) = false, want true", version)
+	}
+
+	// The working folder under _delta_log/.tmp/ must have been cleaned up.
+	tmp, err := store.ListAll(storage.NewPath("_delta_log/.tmp"))
+	if err != nil {
+		t.Fatalf("ListAll(_delta_log/.tmp) failed: %v", err)
+	}
+	if len(tmp.Objects) != 0 {
+		t.Fatalf("checkpoint working folder not cleaned up; _delta_log/.tmp has %d objects: %v",
+			len(tmp.Objects), objectLocations(tmp))
+	}
+
+	t.Logf("checkpoint at version %d written and prefix List verified", version)
+}
+
+func objectLocations(res storage.ListResult) []string {
+	out := make([]string, 0, len(res.Objects))
+	for _, o := range res.Objects {
+		out = append(out, o.Location.Raw)
+	}
+	return out
+}
+
