@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/datalakeerror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/file"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/filesystem"
@@ -79,8 +80,16 @@ type Client interface {
 }
 
 // RealClient is a Client backed by a real ADLS Gen2 filesystem (container).
+//
+// Mutating and point operations use the dfs endpoint (fileSystem), which
+// provides atomic rename. Listing uses the blob endpoint (container), whose
+// List Blobs operation supports true server-side prefix filtering — the dfs
+// ListPaths operation only lists the direct contents of an existing directory,
+// which cannot satisfy delta-go's S3-style prefix List contract on ADLS Gen2
+// (HNS) and would force an O(directory) enumerate-and-filter.
 type RealClient struct {
 	fileSystem *filesystem.Client
+	container  *container.Client
 }
 
 // Compile time check that RealClient implements Client.
@@ -89,17 +98,17 @@ var _ Client = (*RealClient)(nil)
 // NewClient creates a RealClient for the given storage account and filesystem
 // (container) using the provided token credential.
 func NewClient(account string, fileSystemName string, cred azcore.TokenCredential, opts *filesystem.ClientOptions) (*RealClient, error) {
-	serviceURL := fmt.Sprintf("https://%s.dfs.core.windows.net/%s", account, fileSystemName)
-	fsClient, err := filesystem.NewClient(serviceURL, cred, opts)
+	dfsURL := fmt.Sprintf("https://%s.dfs.core.windows.net/%s", account, fileSystemName)
+	fsClient, err := filesystem.NewClient(dfsURL, cred, opts)
 	if err != nil {
 		return nil, err
 	}
-	return &RealClient{fileSystem: fsClient}, nil
-}
-
-// NewClientFromFileSystem wraps an existing ADLS Gen2 filesystem client.
-func NewClientFromFileSystem(fsClient *filesystem.Client) *RealClient {
-	return &RealClient{fileSystem: fsClient}
+	blobURL := fmt.Sprintf("https://%s.blob.core.windows.net/%s", account, fileSystemName)
+	containerClient, err := container.NewClient(blobURL, cred, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &RealClient{fileSystem: fsClient, container: containerClient}, nil
 }
 
 // mapError translates ADLS Gen2 service errors into this package's sentinel errors.
@@ -191,16 +200,28 @@ func (c *RealClient) DeleteDirectory(ctx context.Context, key string) error {
 	return mapError(err)
 }
 
-// List returns a single page of paths under prefix, resuming from marker if set.
+// List returns a single page of paths whose name begins with prefix, resuming
+// from marker if set.
+//
+// It uses the blob endpoint's List Blobs (flat) operation, which performs true
+// server-side prefix filtering — the final path segment may be a partial file
+// name (e.g. "_delta_log/00000000000000000066" matches
+// "…000066.checkpoint.parquet"). The dfs ListPaths operation cannot do this:
+// its Prefix maps to the REST "directory" parameter and only lists the direct
+// contents of an existing directory (404ing on a non-directory prefix), which
+// would force an O(directory) enumerate-and-filter and breaks paging when the
+// prefix is a file-name prefix rather than a real directory.
 func (c *RealClient) List(ctx context.Context, prefix string, marker string) (ListResult, error) {
-	opts := &filesystem.ListPathsOptions{}
+	opts := &container.ListBlobsFlatOptions{
+		Include: container.ListBlobsInclude{Metadata: true},
+	}
 	if prefix != "" {
 		opts.Prefix = &prefix
 	}
 	if marker != "" {
 		opts.Marker = &marker
 	}
-	pager := c.fileSystem.NewListPathsPager(true, opts)
+	pager := c.container.NewListBlobsFlatPager(opts)
 
 	var result ListResult
 	if !pager.More() {
@@ -210,29 +231,34 @@ func (c *RealClient) List(ctx context.Context, prefix string, marker string) (Li
 	if err != nil {
 		return ListResult{}, mapError(err)
 	}
-	for _, p := range page.Paths {
-		if p == nil {
-			continue
-		}
-		item := PathItem{}
-		if p.Name != nil {
-			item.Name = *p.Name
-		}
-		if p.ContentLength != nil {
-			item.ContentLength = *p.ContentLength
-		}
-		if p.IsDirectory != nil {
-			item.IsDirectory = *p.IsDirectory
-		}
-		if p.LastModified != nil {
-			if t, perr := time.Parse(time.RFC1123, *p.LastModified); perr == nil {
-				item.LastModified = t
+	if page.Segment != nil {
+		for _, b := range page.Segment.BlobItems {
+			if b == nil || b.Name == nil {
+				continue
 			}
+			item := PathItem{Name: *b.Name}
+			// HNS directory placeholders surface as zero-length blobs tagged
+			// with metadata hdi_isfolder=true; report them as directories so
+			// callers can skip them, matching the dfs ListPaths behavior.
+			for k, v := range b.Metadata {
+				if strings.EqualFold(k, "hdi_isfolder") && v != nil && strings.EqualFold(*v, "true") {
+					item.IsDirectory = true
+					break
+				}
+			}
+			if b.Properties != nil {
+				if b.Properties.ContentLength != nil {
+					item.ContentLength = *b.Properties.ContentLength
+				}
+				if b.Properties.LastModified != nil {
+					item.LastModified = *b.Properties.LastModified
+				}
+			}
+			result.Paths = append(result.Paths, item)
 		}
-		result.Paths = append(result.Paths, item)
 	}
-	if page.Continuation != nil {
-		result.NextMarker = *page.Continuation
+	if page.NextMarker != nil {
+		result.NextMarker = *page.NextMarker
 	}
 	return result, nil
 }

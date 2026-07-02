@@ -214,70 +214,45 @@ func (s *AzureObjectStore) DeleteFolder(location storage.Path) error {
 	return nil
 }
 
-// List lists objects under a prefix using pagination.
+// List returns the complete set of objects whose key begins with prefix in a
+// single call (NextToken in the returned result is always empty).
+//
+// The underlying client lists via the blob endpoint, which performs true
+// server-side prefix filtering, so no directory/parent handling is required and
+// the cost is O(#matching) rather than O(#entries in the directory). Pages are
+// drained internally with the same stable prefix so the continuation token
+// always matches the request it was minted for.
 func (s *AzureObjectStore) List(prefix storage.Path, previousResult *storage.ListResult) (storage.ListResult, error) {
-	fullPrefix, trimPrefix := s.listInputs(prefix)
-	marker := ""
+	// Everything is returned by the first call, so a paged caller that supplies
+	// a previousResult has nothing more to fetch.
 	if previousResult != nil {
-		marker = previousResult.NextToken
+		return storage.ListResult{}, nil
 	}
+	fullPrefix, trimPrefix := s.listInputs(prefix)
 
-	// ADLS Gen2 ListPaths lists the *contents of a directory* (the SDK's Prefix
-	// option maps to the REST "directory" parameter) and returns 404
-	// PathNotFound when that directory does not exist. delta-go's List contract
-	// is S3-style: return every object whose key begins with the prefix, where
-	// the final path segment may be a partial file name (e.g.
-	// "_delta_log/00000000000000000066" must match
-	// "…000066.checkpoint.parquet"). So:
-	//   1. Try the prefix as a directory (the common, efficient case:
-	//      "_delta_log", a checkpoint working folder, etc.).
-	//   2. If it is not an existing directory, list the PARENT directory and
-	//      filter to names beginning with the full prefix — emulating S3 prefix
-	//      semantics. A missing parent means no matches.
-	res, err := s.Client.List(context.Background(), fullPrefix, marker)
-	if err == nil {
-		return buildListResult(res, "", trimPrefix), nil
-	}
-	if !errors.Is(err, azureutils.ErrNotFound) {
-		return storage.ListResult{}, errors.Join(storage.ErrListObjects, err)
-	}
-
-	parent := ""
-	if i := strings.LastIndex(fullPrefix, "/"); i >= 0 {
-		parent = fullPrefix[:i]
-	}
-	res, err = s.Client.List(context.Background(), parent, marker)
-	if err != nil {
-		if errors.Is(err, azureutils.ErrNotFound) {
-			return storage.ListResult{}, nil
+	var objects []storage.ObjectMeta
+	marker := ""
+	for {
+		res, err := s.Client.List(context.Background(), fullPrefix, marker)
+		if err != nil {
+			return storage.ListResult{}, errors.Join(storage.ErrListObjects, err)
 		}
-		return storage.ListResult{}, errors.Join(storage.ErrListObjects, err)
-	}
-	return buildListResult(res, fullPrefix, trimPrefix), nil
-}
-
-// buildListResult converts an azureutils listing into a storage.ListResult,
-// dropping directory entries, trimming the store's base prefix, and (when
-// namePrefix is non-empty) keeping only paths whose full name begins with
-// namePrefix.
-func buildListResult(res azureutils.ListResult, namePrefix, trimPrefix string) storage.ListResult {
-	listResult := storage.ListResult{Objects: make([]storage.ObjectMeta, 0, len(res.Paths))}
-	for _, p := range res.Paths {
-		if p.IsDirectory {
-			continue
+		for _, p := range res.Paths {
+			if p.IsDirectory {
+				continue
+			}
+			objects = append(objects, storage.ObjectMeta{
+				Location:     storage.NewPath(strings.TrimPrefix(p.Name, trimPrefix)),
+				LastModified: p.LastModified,
+				Size:         p.ContentLength,
+			})
 		}
-		if namePrefix != "" && !strings.HasPrefix(p.Name, namePrefix) {
-			continue
+		if res.NextMarker == "" {
+			break
 		}
-		location := strings.TrimPrefix(p.Name, trimPrefix)
-		listResult.Objects = append(listResult.Objects, storage.ObjectMeta{
-			Location:     storage.NewPath(location),
-			LastModified: p.LastModified,
-			Size:         p.ContentLength,
-		})
+		marker = res.NextMarker
 	}
-	listResult.NextToken = res.NextMarker
-	return listResult
+	return storage.ListResult{Objects: objects}, nil
 }
 
 // ListAll lists all objects under a prefix, paging as required.
