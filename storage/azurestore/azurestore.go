@@ -38,7 +38,7 @@ var ErrMissingAccount error = errors.New("storage account could not be determine
 // AzureObjectStore allows interaction with an ADLS Gen2 object store.
 type AzureObjectStore struct {
 	// Client communicates with ADLS Gen2.
-	Client azureutils.Client
+	Client  azureutils.Client
 	baseURI storage.Path
 	account string
 	// container is the ADLS Gen2 filesystem name.
@@ -217,14 +217,24 @@ func (s *AzureObjectStore) DeleteFolder(location storage.Path) error {
 // List returns the complete set of objects whose key begins with prefix in a
 // single call (NextToken in the returned result is always empty).
 //
+// NOTE: the previousResult argument is NOT respected. Unlike a paging store,
+// this implementation returns every match in one call and always sets
+// NextToken to "", so there is never a "next page" to resume. It exists only to
+// satisfy the storage.ObjectStore interface. Because the whole result set is
+// returned up front (and both in-tree consumers, ListAll and ListIterator, only
+// resume while NextToken != ""), a non-nil previousResult means "you already
+// have everything" and yields an empty result — it never drops rows. Do not
+// build a caller that pages this store by feeding previousResult back in while
+// ignoring NextToken; use ListAll or check NextToken.
+//
 // The underlying client lists via the blob endpoint, which performs true
 // server-side prefix filtering, so no directory/parent handling is required and
 // the cost is O(#matching) rather than O(#entries in the directory). Pages are
 // drained internally with the same stable prefix so the continuation token
 // always matches the request it was minted for.
 func (s *AzureObjectStore) List(prefix storage.Path, previousResult *storage.ListResult) (storage.ListResult, error) {
-	// Everything is returned by the first call, so a paged caller that supplies
-	// a previousResult has nothing more to fetch.
+	// previousResult is ignored (see the doc comment): everything is returned by
+	// the first call, so a caller that supplies one has nothing more to fetch.
 	if previousResult != nil {
 		return storage.ListResult{}, nil
 	}
