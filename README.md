@@ -13,32 +13,6 @@ Our use case is to ingest data, write it to the Delta table folder as a Parquet 
 and then add the Parquet file to the Delta table using delta-go.
 
 
-## Fork changes: ADLS Gen2 (hierarchical-namespace) support
-
-This fork of [`rivian/delta-go`](https://github.com/rivian/delta-go) (diverging
-at upstream `2bc9f0a`) adds an **Azure Data Lake Storage Gen2 (ADLS Gen2 /
-hierarchical-namespace) storage backend** and fixes several places where
-delta-go assumes S3-style storage semantics that do not hold on an HNS account.
-
-| Commit | Change | Why |
-| ------ | ------ | --- |
-| `b1510fb` | Add Azure ADLS Gen2 storage backend (`storage/azurestore`, `internal/azureutils`) | delta-go only shipped Local/S3 stores. |
-| `41557bf` | Doc note on ADLS Gen2 concurrency | Commits are coordinated by ADLS Gen2 atomic rename (`nillock` + optimistic retry), not a DynamoDB-style lock. |
-| `0a9088b` | Parse the `timestamp_ntz` schema type | The schema parser didn't recognize `timestamp_ntz` (tables using it are reader v3 / writer v7). |
-| `d10b353` | `mapError` classifies any HTTP 404 (incl. blob-endpoint `BlobNotFound`) as `ErrNotFound` | `GetProperties`/`Head` is served by the **blob** endpoint, which returns `404 BlobNotFound` rather than the dfs `PathNotFound` the code matched, so `Head` returned the wrong sentinel and broke the checkpoint Head-before-write guard and `LatestVersion`. (The `List` half of this commit was superseded by `c190495`.) |
-| `47f51a6` | `azure_integration` test for on-disk checkpoint + prefix `List` on real HNS | Regression coverage for the HNS fixes (manual, build-tagged). |
-| `c190495` | **`List` reimplemented on the blob endpoint's List Blobs (flat) op** | delta-go's `List` is S3-prefix style (a key prefix whose last segment may be a partial file name, e.g. `_delta_log/<version>` must match `…<version>.checkpoint.parquet`). The dfs `ListPaths` op only lists the **contents of an existing directory** (its `Prefix` maps to the REST `directory` param, 404ing on a file-name prefix), so it cannot satisfy that contract. Emulating it via list-parent-and-filter was `O(#dir)` and, once the directory paginated (>5000 entries), failed with `400 InvalidQueryParameterValue` (the parent's continuation token replayed against the child prefix). Blob `List Blobs` does true server-side prefix filtering → `O(#matching)`, returns empty for non-existent prefixes, and needs no parent fallback. dfs is still used for atomic rename. |
-
-### timestamp_ntz protocol note
-
-A table using `timestamp_ntz` is Delta reader v3 / writer v7, but delta-go's
-checkpoint caps at v1/v1. Callers opt in via
-`CheckpointConfiguration.UnsafeIgnoreUnsupportedReaderWriterVersionErrors` —
-safe here because `timestampNtz` is pure metadata (a protocol action + schema
-string) copied verbatim by `checkpointRows`, with no per-file/per-action fields
-to drop (unlike deletion vectors / column mapping).
-
-
 ## Features
 
 ### Cloud Integrations
