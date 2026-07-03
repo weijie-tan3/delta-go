@@ -55,6 +55,17 @@ and then add the Parquet file to the Delta table using delta-go.
 
 ## Usage
 
+The overall flow is the same for every backend: construct a `storage.ObjectStore` for your
+cloud (see the backend-specific sections below), create or open the table, write your data as a
+Parquet file into the table folder and `store.Put` it (the path is relative to `baseURI`), then
+add the file to the table and commit a transaction. Building the `Add` action and the transaction
+is identical across backends — only the store construction and the commit call
+(`CommitLogStore()` on S3 + LogStore, `Commit()` on atomic-rename stores like ADLS Gen2) differ.
+
+There are also some simple examples available in the `examples/` folder.
+
+### S3
+
 Create a table in S3.  This table is configured to use DynamoDB LogStore locking to enable multi-cluster S3 support.
 ```golang
 	store, err := s3store.New(s3Client, baseURI)
@@ -77,9 +88,11 @@ Append data to the table.  The data is in a parquet file located at `parquetRela
 	v, err := transaction.CommitLogStore()
 ```
 
-There are also some simple examples available in the `examples/` folder.
+If delta-go and other client(s) write to the same Delta table on S3, configure all clients to use
+[multi-cluster LogStore](https://docs.delta.io/latest/delta-storage.html#-delta-storage-s3-multi-cluster)
+to avoid write conflicts.
 
-## Azure (ADLS Gen2)
+### Azure (ADLS Gen2)
 
 delta-go supports Azure Data Lake Storage Gen2 (storage accounts with hierarchical namespace enabled).
 Unlike S3, ADLS Gen2 provides an atomic rename, so concurrent writers are coordinated by the object
@@ -116,7 +129,7 @@ Append on ADLS Gen2 uses the regular `Commit()` (no LogStore needed):
 	v, err := transaction.Commit()
 ```
 
-### Concurrency limitations
+#### Concurrency limitations
 
 Concurrent commits on ADLS Gen2 are coordinated purely by the object store's atomic rename
 (`RenameIfNotExists`) combined with optimistic retry — there is no Azure `Locker` implementation yet.
@@ -134,7 +147,7 @@ For higher write concurrency, serialize commits with a real distributed lock (a 
 implementation, e.g. one backed by an Azure blob lease) rather than relying on optimistic retry, and/or
 increase `RetryWaitDuration` to reduce the request rate.
 
-### Running the Azure integration tests
+#### Running the Azure integration tests
 
 
 The live integration tests are gated behind the `azure_integration` build tag and are skipped unless
@@ -146,12 +159,6 @@ the target account is configured, so they never run as part of `go test ./...`. 
 ```
 Authentication uses `azidentity.DefaultAzureCredential`. The account must have hierarchical namespace
 (ADLS Gen2) enabled.
-
-## Storage configuration on S3
-
-If delta-go and other client(s) are being used to write to the same Delta table on S3, then it is important to configure all clients to use [multi-cluster LogStore](https://docs.delta.io/latest/delta-storage.html#-delta-storage-s3-multi-cluster) to avoid write conflicts.
-
-
 
 
 [open]: https://cdn.jsdelivr.net/gh/Readme-Workflows/Readme-Icons@main/icons/octicons/IssueNeutral.svg
