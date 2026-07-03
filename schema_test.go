@@ -94,7 +94,7 @@ func TestGetSchemaWithWeirdTypes(t *testing.T) {
 func TestUnmarshalSchemaTimestampNtz(t *testing.T) {
 	// Delta tables written by Spark/Databricks encode timestamp-without-timezone
 	// columns as "timestamp_ntz". Loading such a table must not fail to parse.
-	schemaJSON := `{"type":"struct","fields":[{"name":"pushed_at","type":"timestamp_ntz","nullable":true,"metadata":{}}]}`
+	schemaJSON := `{"type":"struct","fields":[{"name":"event_time","type":"timestamp_ntz","nullable":true,"metadata":{}}]}`
 
 	var s SchemaTypeStruct
 	if err := json.Unmarshal([]byte(schemaJSON), &s); err != nil {
